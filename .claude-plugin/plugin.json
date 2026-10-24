@@ -1,8 +1,10 @@
 {
   "name": "solopreneur-ghostwriter",
   "version": "0.1.0",
-  "description": "Drafts WhatsApp replies in a shop owner's own voice and sends them only to her own \"Message yourself\" chat for her to copy and send.",
-  "author": {"name": "whatsapp-mcp contributors"},
+  "description": "Drafts replies to your customers in your own voice, from your past messages, templates and business facts. Works on its own, or with the whatsapp-mcp bridge for automatic drafts.",
+  "author": {"name": "windrichie"},
+  "homepage": "https://github.com/windrichie/solopreneur-ghostwriter",
+  "repository": "https://github.com/windrichie/solopreneur-ghostwriter",
   "license": "MIT",
-  "keywords": ["whatsapp", "drafts", "customer-replies", "small-business"]
+  "keywords": ["whatsapp", "drafts", "customer-replies", "small-business", "solopreneur"]
 }

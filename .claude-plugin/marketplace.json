@@ -1,0 +1,14 @@
+{
+  "name": "solopreneur-ghostwriter",
+  "description": "Ghostwriter: drafts replies to your customers in your own voice.",
+  "owner": {
+    "name": "windrichie"
+  },
+  "plugins": [
+    {
+      "name": "solopreneur-ghostwriter",
+      "source": "./",
+      "description": "Drafts replies to your customers in your own voice."
+    }
+  ]
+}
