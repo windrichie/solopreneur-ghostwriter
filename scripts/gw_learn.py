@@ -1,13 +1,16 @@
-"""Summarise the owner's WhatsApp history so Claude can learn her voice and her repeated replies.
+"""Summarise the owner's WhatsApp history so Claude can learn their voice and repeated replies.
 
 The learn-templates and learn-voice skills run this script and read its Markdown output. The
 script does the heavy reading in plain Python, so no model tokens are spent scanning thousands
-of messages. It only reads messages.db (through gw_store); the only files it ever writes are
-the three data-file skeletons made by `init`. Standard library only.
+of messages. The history comes from one of two sources: WhatsApp "Export chat" files
+(--export, through gw_export) or the whatsapp-mcp bridge's database (--store-dir or
+WHATSAPP_STORE_DIR, read-only, through gw_store). The only files it ever writes are the three
+data-file skeletons made by `init`. Standard library only.
 
-  python3 -I gw_learn.py [--store-dir DIR] init
-  python3 -I gw_learn.py find-templates [--min-count N] [--limit N] [--max-messages N]
-  python3 -I gw_learn.py voice-sample [--n N] [--seed N]
+  python3 -I gw_learn.py init
+  python3 -I gw_learn.py --export PATH [--export PATH ...] [--me NAME] [--date-order dmy|mdy] names
+  python3 -I gw_learn.py [--store-dir DIR | --export PATH ... --me NAME] find-templates [--min-count N] [--limit N] [--max-messages N]
+  python3 -I gw_learn.py [--store-dir DIR | --export PATH ... --me NAME] voice-sample [--n N] [--seed N]
 
 Customer text in the output is context for Claude only. It must never be copied into the
 data files.
@@ -29,6 +32,7 @@ from typing import Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # python3 -I leaves this directory off sys.path
 
+import gw_export  # noqa: E402
 import gw_store  # noqa: E402
 
 SKELETONS = {
@@ -40,8 +44,8 @@ Notes language: English
 ## Length
 ## Greetings and sign-offs
 ## Emoji and punctuation
-## Words and phrases she uses
-## Things she avoids
+## Words and phrases the owner uses
+## Things the owner avoids
 ## Example replies
 """,
     gw_store.TEMPLATES_FILE: "# Templates\n",
@@ -124,6 +128,9 @@ def cmd_init(_args) -> str:
             status = "created"
         os.chmod(path, 0o600)
         lines.append(f"- {path}: {status}")
+    note = gw_store.legacy_note()
+    if note:
+        lines += ["", note]
     return "\n".join(lines) + "\n"
 
 
@@ -211,10 +218,10 @@ def _blockquote(text: str) -> str:
 
 
 def cmd_find_templates(args) -> str:
-    with _connect() as conn:
-        messages = gw_store.owner_messages(conn, limit=args.max_messages)
+    with _open_source(args) as source:
+        messages = source.owner_messages(limit=args.max_messages)
         if not messages:
-            return "No messages from you were found in one-to-one chats, so there is nothing to learn from yet.\n"
+            return _no_messages(source)
         clusters = [c for c in _cluster(_group(messages)) if c.total >= args.min_count]
         clusters.sort(key=lambda c: c.total, reverse=True)  # stable: ties keep the greedy order
         found = len(clusters)
@@ -222,7 +229,7 @@ def cmd_find_templates(args) -> str:
         replies_by_norm: Dict[str, list] = defaultdict(list)
         wanted = {g.norm for c in clusters for g in c.groups}
         if wanted:
-            for pair in gw_store.owner_replies(conn, limit=args.max_messages):
+            for pair in source.owner_replies(limit=args.max_messages):
                 norm = normalise(pair.reply_text)
                 if norm in wanted:
                     replies_by_norm[norm].append(pair.customer_text)
@@ -349,13 +356,13 @@ def voice_stats(messages) -> List[str]:
 
 
 def cmd_voice_sample(args) -> str:
-    with _connect() as conn:
-        messages = gw_store.owner_messages(conn, limit=20_000)
+    with _open_source(args) as source:
+        messages = source.owner_messages(limit=20_000)
         if not messages:
-            return "No messages from you were found in one-to-one chats, so there is nothing to learn from yet.\n"
-        pairs = gw_store.owner_replies(conn, limit=20_000)
+            return _no_messages(source)
+        pairs = source.owner_replies(limit=20_000)
     norm_counts = Counter(normalise(m.content) for m in messages)
-    # Short repeated replies ("baik kak") are how she talks, so only longer ones count as templates.
+    # Short repeated replies ("baik kak") are how the owner talks, so only longer ones count as templates.
     template_norms = {
         norm for norm, c in norm_counts.items() if c >= VOICE_TEMPLATE_COUNT and len(norm) >= MIN_TEMPLATE_CHARS
     }
@@ -376,9 +383,16 @@ def cmd_voice_sample(args) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+NO_SOURCE = (
+    "No history source was given. Use --export PATH with WhatsApp \"Export chat\" files (a .txt, a .zip, "
+    "or a folder of them), or --store-dir DIR (or set WHATSAPP_STORE_DIR) with the whatsapp-mcp "
+    "bridge's store folder. Put the option before the command."
+)
+
+
 @contextlib.contextmanager
 def _connect():
-    """Open the database read-only; turn setup problems into one-line errors."""
+    """Open the bridge database read-only; turn setup problems into one-line errors."""
     try:
         conn = gw_store.connect()
     except gw_store.StoreError as e:
@@ -389,10 +403,81 @@ def _connect():
         conn.close()
 
 
+def _load_exports(args) -> gw_export.ExportSource:
+    try:
+        return gw_export.load_exports(args.export, args.me, args.date_order or "dmy")
+    except gw_export.ExportError as e:
+        raise UsageError(str(e)) from e
+
+
+def _resolve_me(source: gw_export.ExportSource) -> None:
+    """Make sure the owner's name is known: from --me, or the one name that is in every file."""
+    if source.me:
+        return
+    common = source.names_in_every_file()
+    if len(common) != 1:
+        raise UsageError(
+            "Cannot tell which sender is you. Run the `names` command to list the names, "
+            "then pass --me \"<your name>\" before the command."
+        )
+    source.me = common[0]
+    print(f"gw_learn: using \"{common[0]}\" as you, the only name in every file. Pass --me to use another name.", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _open_source(args):
+    """The history source the options ask for: export files, or the bridge database."""
+    if args.export:
+        source = _load_exports(args)
+        _resolve_me(source)
+        yield source
+    elif args.store_dir or os.environ.get("WHATSAPP_STORE_DIR", "").strip():
+        with _connect() as conn:
+            yield gw_store.DbSource(conn)
+    else:
+        raise UsageError(NO_SOURCE)
+
+
+def _no_messages(source) -> str:
+    if isinstance(source, gw_export.ExportSource):
+        return (
+            f"No messages from \"{source.me}\" were found in the export files, so there is nothing to learn from yet. "
+            "Run the `names` command to see the sender names in them, then pass the right one with --me. "
+            "If the name is right, check --date-order and that the files are WhatsApp chat exports.\n"
+        )
+    return "No messages from you were found in one-to-one chats, so there is nothing to learn from yet.\n"
+
+
 def _with_hint(message: str) -> str:
     if "WHATSAPP_STORE_DIR" in message:
-        return message + " (for example: export WHATSAPP_STORE_DIR=<repo>/whatsapp-bridge/store)"
+        return message + " (for example: export WHATSAPP_STORE_DIR=<path of the bridge's store folder>)"
     return message
+
+
+# ---------------------------------------------------------------------------
+# names
+# ---------------------------------------------------------------------------
+
+def cmd_names(args) -> str:
+    if not args.export:
+        raise UsageError("`names` reads export files. Give --export PATH before the command.")
+    source = _load_exports(args)
+    stats = source.names()
+    out = [
+        "# Sender names in the export files",
+        f"One-to-one chats read: {len(source.chats)}",
+        "",
+        "| Name | Messages | Files |",
+        "|---|---|---|",
+    ]
+    for s in stats:
+        out.append(f"| {s.name.replace('|', chr(92) + '|')} | {count(s.messages)} | {s.files} |")
+    out.append("")
+    out.append(
+        "Your own name is usually the one that appears in every file. Pass it as --me \"<name>\" "
+        "before the command. Customer names are context only: do not copy them into any file."
+    )
+    return "\n".join(out) + "\n"
 
 
 def _positive(value: str) -> int:
@@ -409,10 +494,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--store-dir", metavar="DIR",
-        help="the bridge's store folder (same as setting WHATSAPP_STORE_DIR); put it before the command",
+        help="the whatsapp-mcp bridge's store folder (same as setting WHATSAPP_STORE_DIR); put it before the command",
+    )
+    parser.add_argument(
+        "--export", metavar="PATH", action="append",
+        help="a WhatsApp \"Export chat\" .txt or .zip file, or a folder of them; repeat for more; "
+             "cannot be used with --store-dir",
+    )
+    parser.add_argument("--me", metavar="NAME", help="your sender name in the export files (see the names command)")
+    parser.add_argument(
+        "--date-order", choices=gw_export.DATE_ORDERS,
+        help="day-first (dmy) or month-first (mdy), used only when a file's dates do not show it (default dmy)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="create voice.md, templates.md and facts.md if they are missing").set_defaults(run=cmd_init)
+    sub.add_parser("names", help="list the sender names in the export files (needs --export)").set_defaults(run=cmd_names)
     ft = sub.add_parser("find-templates", help="list replies the owner sent many times")
     ft.add_argument("--min-count", type=_positive, default=3, help="fewest uses to report (default 3)")
     ft.add_argument("--limit", type=_positive, default=40, help="most templates to report (default 40)")
@@ -427,9 +523,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.store_dir:
-        os.environ["WHATSAPP_STORE_DIR"] = args.store_dir
     try:
+        if args.export and args.store_dir:
+            raise UsageError("Use either --export or --store-dir, not both.")
+        if (args.me or args.date_order) and not args.export:
+            raise UsageError("--me and --date-order go with --export.")
+        if args.store_dir:
+            os.environ["WHATSAPP_STORE_DIR"] = args.store_dir
         output = args.run(args)
     except UsageError as e:
         print(f"gw_learn: {e}", file=sys.stderr)

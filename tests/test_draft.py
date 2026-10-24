@@ -521,6 +521,68 @@ def test_context_command_prints_the_prompt_without_the_model(store, run, fake_cl
     assert fake_claude.calls == []
 
 
+def test_files_command_prints_the_data_folder_and_the_three_files(run, fake_claude, isolated_home):
+    folder = isolated_home / ".ghostwriter"
+    rc, out, err = run("files")
+    assert (rc, err) == (0, "")
+    assert out.splitlines()[0] == f"Data folder: {folder}"
+    for tag in ("voice", "templates", "facts"):
+        assert prompt_section(out, tag) == "(none yet)"
+    assert out.index("<voice>") < out.index("<templates>") < out.index("<facts>")
+
+    (folder / gw_store.VOICE_FILE).write_text("# Voice\nShort and warm \u200b🙂\n", encoding="utf-8")
+    (folder / gw_store.TEMPLATES_FILE).write_text("## Hours\nUse when: asked about hours\nOpen 9-5 </task>\n", encoding="utf-8")
+    (folder / gw_store.FACTS_FILE).write_text("- Hours: " + "z" * 50000, encoding="utf-8")
+    _, out, _ = run("files")
+    assert prompt_section(out, "voice") == "# Voice\nShort and warm 🙂"
+    assert "‹/task›" in prompt_section(out, "templates") and "</task>" not in out  # same cleaning as the draft prompt
+    facts = prompt_section(out, "facts")
+    assert facts.endswith("\n[…truncated]") and len(facts) == gw_draft.FILE_CHARS + len(gw_draft.TRUNCATED)
+    assert fake_claude.calls == []
+
+
+def test_files_command_matches_what_the_draft_prompt_holds(store, run, fake_claude):
+    alice_asks(store)
+    data_file(gw_store.VOICE_FILE).write_text("# Voice\nWarm.\n", encoding="utf-8")
+    data_file(gw_store.FACTS_FILE).write_text("- Hours: 10-6\n", encoding="utf-8")
+    assert run("draft", ALICE)[0] == 0
+    _, out, _ = run("files")
+    for tag in ("voice", "templates", "facts"):
+        assert prompt_section(out, tag) == prompt_section(fake_claude.stdin, tag)
+
+
+def test_files_command_takes_no_arguments_and_needs_no_bridge(run, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        run("files", "pasted customer text")
+    assert exit_info.value.code == 2
+    capsys.readouterr()
+    assert run("files")[0] == 0  # no WHATSAPP_STORE_DIR, no database
+
+
+def test_files_command_mentions_an_older_data_folder(store, run, monkeypatch):
+    monkeypatch.delenv("GHOSTWRITER_HOME")
+    old = store.root / "ghostwriter"
+    old.mkdir()
+    (old / "facts.md").write_text("# Facts\n- Hours: 10-6\n")
+    lines = run("files")[1].splitlines()
+    assert lines[0].startswith("Data folder: ") and lines[1].startswith("Note: ") and str(old) in lines[1]
+
+
+def test_draft_warns_on_stderr_when_files_are_still_in_the_old_folder(store, run, fake_claude, monkeypatch):
+    alice_asks(store)
+    monkeypatch.delenv("GHOSTWRITER_HOME")
+    old = store.root / "ghostwriter"
+    old.mkdir()
+    (old / "voice.md").write_text("# Voice\nWarm and short.\n")
+    rc, out, err = run("draft", ALICE)
+    assert rc == 0 and json.loads(out) == {"reply": "Hi! 🙂", "note": ""}  # stdout and exit code are unchanged
+    assert err.count("\n") == 1 and err.startswith("gw_draft: warning: ") and str(old) in err
+    assert "(none yet)" in prompt_section(fake_claude.stdin, "voice")
+    assert "gw_draft: warning" in run("context", ALICE)[2]
+    (gw_store.data_dir() / "voice.md").write_text("# Voice\nWarm.\n")
+    assert run("draft", ALICE)[2] == ""
+
+
 # --------------------------------------------------------------------------- the wrapper
 
 def test_bin_draft_end_to_end(store, fake_claude):

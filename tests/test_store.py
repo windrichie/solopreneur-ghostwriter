@@ -70,6 +70,55 @@ def test_chat_jid_validation():
             gw_store.validate_chat_jid(bad)
 
 
+def test_data_dir_defaults_to_a_private_folder_in_home(isolated_home):
+    path = gw_store.data_dir()
+    assert path == isolated_home / ".ghostwriter"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+def test_data_dir_does_not_depend_on_the_bridge_store(store, monkeypatch, isolated_home):
+    monkeypatch.delenv("GHOSTWRITER_HOME")
+    assert gw_store.data_dir() == isolated_home / ".ghostwriter"
+    monkeypatch.delenv("WHATSAPP_STORE_DIR")
+    assert gw_store.data_dir() == isolated_home / ".ghostwriter"
+
+
+def test_ghostwriter_home_overrides_the_default(tmp_path, monkeypatch, isolated_home):
+    monkeypatch.setenv("GHOSTWRITER_HOME", str(tmp_path / "shop-two"))
+    path = gw_store.data_dir()
+    assert path == tmp_path / "shop-two" and stat.S_IMODE(path.stat().st_mode) == 0o700
+    assert not (isolated_home / ".ghostwriter").exists()
+
+
+def test_data_dir_is_tightened_when_it_already_exists(isolated_home):
+    folder = isolated_home / ".ghostwriter"
+    folder.mkdir(mode=0o755)
+    folder.chmod(0o755)
+    assert stat.S_IMODE(gw_store.data_dir().stat().st_mode) == 0o700
+
+
+def test_legacy_folder_is_noticed_only_when_it_holds_files(store, monkeypatch, isolated_home):
+    monkeypatch.delenv("GHOSTWRITER_HOME")
+    assert gw_store.legacy_note() is None
+    old = store.root / "ghostwriter"
+    old.mkdir()
+    assert gw_store.legacy_note() is None  # empty
+    (old / "voice.md").write_text("# Voice\nNotes language: English\n## Tone\n")
+    assert gw_store.legacy_note() is None  # only the skeleton
+    (old / "voice.md").write_text("# Voice\nNotes language: English\n## Tone\nWarm and short.\n")
+    note = gw_store.legacy_note()
+    assert str(old) in note and str(isolated_home / ".ghostwriter") in note and "GHOSTWRITER_HOME" in note
+    new = isolated_home / ".ghostwriter"
+    new.mkdir(mode=0o700, exist_ok=True)
+    (new / "voice.md").write_text("# Voice\n## Tone\n")  # a fresh skeleton does not hide the note
+    assert gw_store.legacy_note() is not None
+    (new / "facts.md").write_text("# Facts\n- Hours: 10-6\n")  # real content in the new folder: no note
+    assert gw_store.legacy_note() is None
+    (new / "facts.md").unlink()
+    monkeypatch.setenv("GHOSTWRITER_HOME", str(old))  # already using the old folder
+    assert gw_store.legacy_note() is None
+
+
 def test_missing_store_is_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path / "nope"))
     with pytest.raises(gw_store.StoreError, match="No message database"):
