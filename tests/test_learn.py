@@ -1,5 +1,6 @@
 """Tests for gw_learn.py (the learn-templates and learn-voice helper)."""
 import re
+import zipfile
 import stat
 import time
 from pathlib import Path
@@ -60,7 +61,7 @@ def test_find_templates_groups_variants(store, capsys):
         store.message(jid, text, ts(day, 1), from_me=True)
     for i in range(10):
         store.message(chat_jid(20 + i), "ok kak", ts(15, i), from_me=True)
-    # copies in a group chat and in her own chat must not count
+    # copies in a group chat and in the owner's own chat must not count
     store.message("120363025246125486@g.us", DIRECTIONS.format(d=20), ts(20), from_me=True)
     store.message(OWN_JID, DIRECTIONS.format(d=21), ts(21), from_me=True)
 
@@ -129,7 +130,7 @@ def test_voice_sample_is_spread_and_deterministic(store, capsys):
 
 
 def test_voice_sample_keeps_short_repeated_replies(store, capsys):
-    for c in range(4):  # a short reply she repeats is how she talks, not a template
+    for c in range(4):  # a short reply the owner repeats is how they talk, not a template
         store.message(chat_jid(c), "ada stok kak?", ts(27, c))
         store.message(chat_jid(c), "baik kak", ts(27, c + 10), from_me=True)
     _, out, _ = run(capsys, "voice-sample")
@@ -161,13 +162,18 @@ def test_voice_sample_excludes_self_chat_and_groups(store, capsys):
     assert "Messages analysed: 1" in out
 
 
-def test_missing_store_dir_is_a_clear_error(monkeypatch, capsys):
-    monkeypatch.delenv("WHATSAPP_STORE_DIR", raising=False)
-    monkeypatch.delenv("GHOSTWRITER_HOME", raising=False)
-    for cmd in ("find-templates", "voice-sample", "init"):
+def test_no_source_is_a_clear_error_that_explains_both_options(capsys):
+    for cmd in ("find-templates", "voice-sample"):
         code, out, err = run(capsys, cmd)
-        assert code == 1 and out == ""
-        assert "WHATSAPP_STORE_DIR" in err and err.count("\n") == 1
+        assert code == 1 and out == "" and err.count("\n") == 1
+        assert "--export" in err and "--store-dir" in err and "WHATSAPP_STORE_DIR" in err
+
+
+def test_init_needs_no_history_source(tmp_path, capsys):
+    code, out, _ = run(capsys, "init")
+    home = tmp_path / "home" / ".ghostwriter"
+    assert code == 0 and str(home) in out
+    assert (home / "voice.md").is_file()
 
 
 def test_missing_database_is_a_clear_error(store, capsys):
@@ -207,3 +213,125 @@ def test_store_dir_option_replaces_the_environment_variable(store, monkeypatch, 
     monkeypatch.delenv("WHATSAPP_STORE_DIR")
     code, out, _ = run(capsys, "--store-dir", str(store.root), "voice-sample")
     assert code == 0 and "friendly reply" in out
+
+
+# --------------------------------------------------------------------------- export source
+
+def write_exports(root):
+    """Two made-up chats between the owner ("Sam Shop") and two customers."""
+    root.mkdir()
+    directions = "Hi! The shop is at 12 Maple Street, second floor, open until 6 pm. See you!"
+    ios = []
+    for i, day in enumerate((3, 5, 9)):
+        ios.append(f"[{day:02d}/03/2025, 10:0{i}:00] Alice: where is your shop?")
+        ios.append(f"[{day:02d}/03/2025, 10:0{i}:30] Sam Shop: {directions}")
+    ios.append("[10/03/2025, 11:00:00] Alice: thanks")
+    ios.append("[10/03/2025, 11:01:00] Sam Shop: you are welcome 🙂")
+    (root / "WhatsApp Chat - Alice.txt").write_text("\n".join(ios) + "\n", encoding="utf-8")
+    android = [
+        "11/03/2025, 09:00 - Bob: halo, toko di mana?",
+        f"11/03/2025, 09:01 - Sam Shop: {directions}",
+        "12/03/2025, 09:00 - Bob: ada stok?",
+        "12/03/2025, 09:01 - Sam Shop: ada kak 🙂",
+    ]
+    with zipfile.ZipFile(root / "WhatsApp Chat - Bob.zip", "w") as zf:
+        zf.writestr("_chat.txt", "\n".join(android) + "\n")
+    return root
+
+
+def test_names_lists_senders_with_counts_and_files(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    code, out, err = run(capsys, "--export", str(root), "names")
+    assert code == 0 and err == ""
+    assert "| Sam Shop | 6 | 2 |" in out and "| Alice | 4 | 1 |" in out and "| Bob | 2 | 1 |" in out
+    assert out.index("Sam Shop") < out.index("Alice") < out.index("Bob")
+
+
+def test_names_needs_an_export(store, capsys):
+    code, out, err = run(capsys, "names")
+    assert code == 1 and out == "" and "--export" in err
+
+
+def test_find_templates_from_exports(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    code, out, err = run(capsys, "--export", str(root), "--me", "sam shop", "find-templates")
+    assert code == 0 and err == ""
+    assert "Used 4 times in 2 chats" in out and "2 variants" not in out
+    assert '- "where is your shop?"' in out
+    assert "> Hi! The shop is at 12 Maple Street" in out
+    assert "Alice" not in out and "Bob" not in out  # customer names stay out of the summary
+
+
+def test_voice_sample_from_exports(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    code, out, _ = run(capsys, "--export", str(root / "WhatsApp Chat - Alice.txt"), "--export", str(root / "WhatsApp Chat - Bob.zip"),
+                       "--me", "Sam Shop", "voice-sample")
+    assert code == 0
+    assert "Messages analysed: 6" in out and "## Sample replies (" in out
+    assert "Customer: thanks\nOwner: you are welcome 🙂" in out
+    assert "Owner: ada kak 🙂" in out
+
+
+def test_me_is_found_when_one_name_is_in_every_file(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    code, out, err = run(capsys, "--export", str(root), "voice-sample")
+    assert code == 0 and "Messages analysed: 6" in out
+    assert 'using "Sam Shop" as you' in err and err.count("\n") == 1
+
+
+def test_me_cannot_be_found_when_it_is_unclear(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    for args in (["--export", str(root / "WhatsApp Chat - Alice.txt")], ["--export", str(root / "WhatsApp Chat - Bob.zip")]):
+        code, out, err = run(capsys, *args, "find-templates")  # one file: both names are in every file
+        assert code == 1 and out == "" and "names" in err and "--me" in err and err.count("\n") == 1
+
+
+def test_wrong_me_says_nothing_was_found_and_suggests_names(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    for command in ("find-templates", "voice-sample"):
+        code, out, _ = run(capsys, "--export", str(root), "--me", "Nobody", command)
+        assert code == 0 and "No messages from \"Nobody\"" in out and "`names`" in out and "--date-order" in out
+
+
+def test_date_order_option_reaches_the_parser(tmp_path, capsys):
+    root = tmp_path / "exports"
+    root.mkdir()
+    (root / "a.txt").write_text(
+        "03/04/2025, 10:00 - Alice: a question\n03/04/2025, 10:01 - Sam: a long enough reply to be counted here\n"
+    )
+    _, out, _ = run(capsys, "--export", str(root), "--me", "Sam", "--date-order", "mdy", "find-templates", "--min-count", "1")
+    assert "first 2025-03-04" in out
+    _, out, _ = run(capsys, "--export", str(root), "--me", "Sam", "find-templates", "--min-count", "1")
+    assert "first 2025-04-03" in out
+
+
+def test_export_and_store_dir_together_are_refused(store, tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    code, out, err = run(capsys, "--store-dir", str(store.root), "--export", str(root), "names")
+    assert code == 1 and out == "" and "not both" in err
+
+
+def test_me_and_date_order_need_an_export(store, capsys):
+    for extra in (["--me", "Sam"], ["--date-order", "mdy"]):
+        code, out, err = run(capsys, *extra, "find-templates")
+        assert code == 1 and out == "" and "--export" in err
+
+
+def test_export_source_wins_over_the_environment_variable(store, tmp_path, capsys):
+    store.message(chat_jid(1), "a question", ts(1, 0))
+    store.message(chat_jid(1), "A reply that comes from the database only", ts(1, 1), from_me=True)
+    root = write_exports(tmp_path / "exports")
+    _, out, _ = run(capsys, "--export", str(root), "--me", "Sam Shop", "voice-sample")
+    assert "database only" not in out and "Messages analysed: 6" in out
+
+
+def test_bad_export_path_is_a_clear_error(tmp_path, capsys):
+    code, out, err = run(capsys, "--export", str(tmp_path / "nope"), "--me", "Sam", "find-templates")
+    assert code == 1 and out == "" and "no such file" in err and err.count("\n") == 1
+
+
+def test_exports_are_read_only(tmp_path, capsys):
+    root = write_exports(tmp_path / "exports")
+    before = {p.name: p.read_bytes() for p in root.iterdir()}
+    run(capsys, "--export", str(root), "--me", "Sam Shop", "voice-sample")
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == before

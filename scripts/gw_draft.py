@@ -1,10 +1,15 @@
 """Draft a WhatsApp reply for one customer chat, in the owner's voice.
 
-The bridge runs `bin/draft <chat_jid>` after a customer stops typing. This script reads the chat
-and the owner's past replies from the bridge's database (read-only), asks `claude -p` for a draft
-and prints one JSON object, {"reply": ..., "note": ...}. It never sends anything: the bridge sends
-the draft to the owner's own chat. Message text comes from other people, so it is only ever data:
-the model gets no tools, and every untrusted string is cleaned before it goes into the prompt.
+The whatsapp-mcp bridge runs `bin/draft <chat_jid>` after a customer stops typing. This script
+reads the chat and the owner's past replies from the bridge's database (read-only), asks
+`claude -p` for a draft and prints one JSON object, {"reply": ..., "note": ...}. It never sends
+anything: the bridge sends the draft to the owner's own chat. Message text comes from other
+people, so it is only ever data: the model gets no tools, and every untrusted string is cleaned
+before it goes into the prompt.
+
+`files` is for drafting by hand in Claude Code, with no bridge: it prints the owner's data files
+as the draft prompt holds them, and the draft-reply skill drafts in the session. It calls no model
+and takes no text from the customer.
 
 Exit 0: stdout is exactly one JSON object ("reply" is empty when no reply is needed).
 Exit 1: stdout is empty; stderr has one line that names the failure, never message text.
@@ -373,7 +378,7 @@ def call_model(system_prompt: str, user_message: str) -> Answer:
 
 def finish_draft(answer: Answer) -> Dict[str, str]:
     """Clean the model's answer: no hidden characters, a one-line note, and a note whenever a
-    [CHECK: …] placeholder is in the reply, so that she cannot paste it unseen."""
+    [CHECK: …] placeholder is in the reply, so that the owner cannot paste it unseen."""
     reply = _clip(gw_store.clean_text(answer.reply).strip(), REPLY_CHARS)
     note = _one_line(gw_store.clean_text(answer.note), NOTE_CHARS)
     if re.search(r"\[\s*check\b", reply, re.IGNORECASE) and not note:
@@ -415,7 +420,16 @@ def _load_context(chat_jid: str) -> Context:
         return build_context(conn, chat_jid)
 
 
+def _warn_about_old_folder() -> None:
+    """One stderr line when the owner's files are still in the folder older versions used.
+    Stdout and the exit code are not affected."""
+    note = gw_store.legacy_note()
+    if note:
+        print("gw_draft: warning: " + _one_line(note, 1000), file=sys.stderr)
+
+
 def cmd_draft(chat_jid: str) -> None:
+    _warn_about_old_folder()
     ctx = _load_context(chat_jid)
     skip = _skip_note(ctx)
     if skip is not None:
@@ -431,9 +445,24 @@ def cmd_draft(chat_jid: str) -> None:
 
 
 def cmd_context(chat_jid: str) -> None:
+    _warn_about_old_folder()
     ctx = _load_context(chat_jid)
     status = _skip_note(ctx) or f"{len(ctx.pending)} unanswered customer message(s)"
     _write_stdout(f"System prompt: {SKILL_FILE}\nStatus: {status}\n\n{render_prompt(ctx)}")
+
+
+def cmd_files() -> None:
+    """The data folder and the three data files, cleaned and capped as in the draft prompt."""
+    lines = [f"Data folder: {gw_store.data_dir()}"]
+    note = gw_store.legacy_note()
+    if note:
+        lines.append(note)
+    lines += [
+        "<voice>", _read_data_file(gw_store.VOICE_FILE), "</voice>",
+        "<templates>", _read_data_file(gw_store.TEMPLATES_FILE), "</templates>",
+        "<facts>", _read_data_file(gw_store.FACTS_FILE), "</facts>",
+    ]
+    _write_stdout("\n".join(lines) + "\n")
 
 
 def _failure_line(error: Exception) -> str:
@@ -457,17 +486,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     draft = sub.add_parser("draft", help="print the draft as JSON: {\"reply\": ..., \"note\": ...} (calls claude)")
     draft.add_argument("chat_jid", help="the customer's chat, for example 6591234567@s.whatsapp.net")
-    draft.set_defaults(func=cmd_draft)
+    draft.set_defaults(func=lambda args: cmd_draft(args.chat_jid))
     context = sub.add_parser("context", help="print the prompt a draft would use; does not call claude")
     context.add_argument("chat_jid")
-    context.set_defaults(func=cmd_context)
+    context.set_defaults(func=lambda args: cmd_context(args.chat_jid))
+    files = sub.add_parser(
+        "files", help="print the data folder and the voice, templates and facts files; does not call claude"
+    )
+    files.set_defaults(func=lambda args: cmd_files())
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)  # a bad command line exits 2 here; the wrapper checks its own
     try:
-        args.func(args.chat_jid)
+        args.func(args)
     except Exception as e:  # one line, no message text, nothing on stdout
         print(_failure_line(e), file=sys.stderr)
         return 1

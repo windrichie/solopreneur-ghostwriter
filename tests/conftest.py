@@ -1,6 +1,6 @@
 """Shared fixtures for the ghostwriter scripts.
 
-`store` builds a throwaway bridge store with the bridge's exact schema. Every ghostwriter test
+`isolated_home` runs for every test and points HOME at a temporary folder. `store` builds a throwaway bridge store with the bridge's exact schema. Every ghostwriter test
 uses it; extend the helpers here rather than building databases by hand in a test file.
 """
 import sqlite3
@@ -73,6 +73,17 @@ class Store:
         for i, (who, text) in enumerate(turns):
             ts = f"2025-01-02 {start_hour:02d}:{i:02d}:00+08:00"
             self.message(chat_jid, text, ts, from_me=(who == "me"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    """No test may read or write the real home folder or the real data folder (~/.ghostwriter)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GHOSTWRITER_HOME", raising=False)
+    monkeypatch.delenv("WHATSAPP_STORE_DIR", raising=False)
+    return home
 
 
 @pytest.fixture
